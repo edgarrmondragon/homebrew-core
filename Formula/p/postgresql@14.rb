@@ -4,6 +4,7 @@ class PostgresqlAT14 < Formula
   url "https://ftp.postgresql.org/pub/source/v14.10/postgresql-14.10.tar.bz2"
   sha256 "c99431c48e9d470b0d0ab946eb2141a3cd19130c2fb4dc4b3284a7774ecc8399"
   license "PostgreSQL"
+  revision 1
 
   livecheck do
     url "https://ftp.postgresql.org/pub/source/"
@@ -43,6 +44,11 @@ class PostgresqlAT14 < Formula
     depends_on "linux-pam"
     depends_on "util-linux"
   end
+
+  # Fix compatibility with OpenSSL 3.2
+  # Remove once merged
+  # Ref https://www.postgresql.org/message-id/CX9SU44GH3P4.17X6ZZUJ5D40N%40neon.tech
+  patch :DATA
 
   def install
     ENV.prepend "LDFLAGS", "-L#{Formula["openssl@3"].opt_lib} -L#{Formula["readline"].opt_lib}"
@@ -183,3 +189,150 @@ class PostgresqlAT14 < Formula
     assert_equal "#{HOMEBREW_PREFIX}/include/#{name}", shell_output("#{bin}/pg_config --includedir").chomp
   end
 end
+
+__END__
+diff --git a/configure b/configure
+index 62a921b5e7..812b535f2e 100755
+--- a/configure
++++ b/configure
+@@ -13071,7 +13071,7 @@ done
+   # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
+   # doesn't have these OpenSSL 1.1.0 functions. So check for individual
+   # functions.
+-  for ac_func in OPENSSL_init_ssl BIO_get_data BIO_meth_new ASN1_STRING_get0_data HMAC_CTX_new HMAC_CTX_free
++  for ac_func in OPENSSL_init_ssl BIO_meth_new ASN1_STRING_get0_data HMAC_CTX_new HMAC_CTX_free
+ do :
+   as_ac_var=`$as_echo "ac_cv_func_$ac_func" | $as_tr_sh`
+ ac_fn_c_check_func "$LINENO" "$ac_func" "$as_ac_var"
+diff --git a/configure.ac b/configure.ac
+index a3243cc7e8..4a4852ca3d 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1311,7 +1311,7 @@ if test "$with_ssl" = openssl ; then
+   # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
+   # doesn't have these OpenSSL 1.1.0 functions. So check for individual
+   # functions.
+-  AC_CHECK_FUNCS([OPENSSL_init_ssl BIO_get_data BIO_meth_new ASN1_STRING_get0_data HMAC_CTX_new HMAC_CTX_free])
++  AC_CHECK_FUNCS([OPENSSL_init_ssl BIO_meth_new ASN1_STRING_get0_data HMAC_CTX_new HMAC_CTX_free])
+   # OpenSSL versions before 1.1.0 required setting callback functions, for
+   # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
+   # function was removed.
+diff --git a/src/backend/libpq/be-secure-openssl.c b/src/backend/libpq/be-secure-openssl.c
+index 13ac961442..78c271a937 100644
+--- a/src/backend/libpq/be-secure-openssl.c
++++ b/src/backend/libpq/be-secure-openssl.c
+@@ -823,10 +823,6 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
+  * to retry; do we need to adopt their logic for that?
+  */
+
+-#ifndef HAVE_BIO_GET_DATA
+-#define BIO_get_data(bio) (bio->ptr)
+-#define BIO_set_data(bio, data) (bio->ptr = data)
+-#endif
+
+ static BIO_METHOD *my_bio_methods = NULL;
+
+@@ -837,7 +833,7 @@ my_sock_read(BIO *h, char *buf, int size)
+
+ 	if (buf != NULL)
+ 	{
+-		res = secure_raw_read(((Port *) BIO_get_data(h)), buf, size);
++		res = secure_raw_read(((Port *) BIO_get_app_data(h)), buf, size);
+ 		BIO_clear_retry_flags(h);
+ 		if (res <= 0)
+ 		{
+@@ -857,7 +853,7 @@ my_sock_write(BIO *h, const char *buf, int size)
+ {
+ 	int			res = 0;
+
+-	res = secure_raw_write(((Port *) BIO_get_data(h)), buf, size);
++	res = secure_raw_write(((Port *) BIO_get_app_data(h)), buf, size);
+ 	BIO_clear_retry_flags(h);
+ 	if (res <= 0)
+ 	{
+@@ -933,7 +929,7 @@ my_SSL_set_fd(Port *port, int fd)
+ 		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
+ 		goto err;
+ 	}
+-	BIO_set_data(bio, port);
++	BIO_set_app_data(bio, port);
+
+ 	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+ 	SSL_set_bio(port->ssl, bio, bio);
+diff --git a/src/include/pg_config.h.in b/src/include/pg_config.h.in
+index 40d513c128..51fa911fb6 100644
+--- a/src/include/pg_config.h.in
++++ b/src/include/pg_config.h.in
+@@ -86,9 +86,6 @@
+ /* Define to 1 if you have the `backtrace_symbols' function. */
+ #undef HAVE_BACKTRACE_SYMBOLS
+
+-/* Define to 1 if you have the `BIO_get_data' function. */
+-#undef HAVE_BIO_GET_DATA
+-
+ /* Define to 1 if you have the `BIO_meth_new' function. */
+ #undef HAVE_BIO_METH_NEW
+
+diff --git a/src/interfaces/libpq/fe-secure-openssl.c b/src/interfaces/libpq/fe-secure-openssl.c
+index 7f27767da6..528fa55f9d 100644
+--- a/src/interfaces/libpq/fe-secure-openssl.c
++++ b/src/interfaces/libpq/fe-secure-openssl.c
+@@ -1661,11 +1661,6 @@ PQsslAttribute(PGconn *conn, const char *attribute_name)
+  * to retry; do we need to adopt their logic for that?
+  */
+
+-#ifndef HAVE_BIO_GET_DATA
+-#define BIO_get_data(bio) (bio->ptr)
+-#define BIO_set_data(bio, data) (bio->ptr = data)
+-#endif
+-
+ static BIO_METHOD *my_bio_methods;
+
+ static int
+@@ -1673,7 +1668,7 @@ my_sock_read(BIO *h, char *buf, int size)
+ {
+ 	int			res;
+
+-	res = pqsecure_raw_read((PGconn *) BIO_get_data(h), buf, size);
++	res = pqsecure_raw_read((PGconn *) BIO_get_app_data(h), buf, size);
+ 	BIO_clear_retry_flags(h);
+ 	if (res < 0)
+ 	{
+@@ -1703,7 +1698,7 @@ my_sock_write(BIO *h, const char *buf, int size)
+ {
+ 	int			res;
+
+-	res = pqsecure_raw_write((PGconn *) BIO_get_data(h), buf, size);
++	res = pqsecure_raw_write((PGconn *) BIO_get_app_data(h), buf, size);
+ 	BIO_clear_retry_flags(h);
+ 	if (res < 0)
+ 	{
+@@ -1794,7 +1789,7 @@ my_SSL_set_fd(PGconn *conn, int fd)
+ 		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
+ 		goto err;
+ 	}
+-	BIO_set_data(bio, conn);
++	BIO_set_app_data(bio, conn);
+
+ 	SSL_set_bio(conn->ssl, bio, bio);
+ 	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+diff --git a/src/tools/msvc/Solution.pm b/src/tools/msvc/Solution.pm
+index 577b5afea7..53d60dbd25 100644
+--- a/src/tools/msvc/Solution.pm
++++ b/src/tools/msvc/Solution.pm
+@@ -229,7 +229,6 @@ sub GenerateFiles
+ 		HAVE_ATOMICS               => 1,
+ 		HAVE_ATOMIC_H              => undef,
+ 		HAVE_BACKTRACE_SYMBOLS     => undef,
+-		HAVE_BIO_GET_DATA          => undef,
+ 		HAVE_BIO_METH_NEW          => undef,
+ 		HAVE_CLOCK_GETTIME         => undef,
+ 		HAVE_COMPUTED_GOTO         => undef,
+@@ -562,7 +561,6 @@ sub GenerateFiles
+ 			|| ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0'))
+ 		{
+ 			$define{HAVE_ASN1_STRING_GET0_DATA} = 1;
+-			$define{HAVE_BIO_GET_DATA}          = 1;
+ 			$define{HAVE_BIO_METH_NEW}          = 1;
+ 			$define{HAVE_HMAC_CTX_FREE}         = 1;
+ 			$define{HAVE_HMAC_CTX_NEW}          = 1;
