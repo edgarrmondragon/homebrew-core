@@ -4,6 +4,7 @@ class PostgresqlAT12 < Formula
   url "https://ftp.postgresql.org/pub/source/v12.17/postgresql-12.17.tar.bz2"
   sha256 "93e8e1b23981d5f03c6c5763f77b28184c1ce4db7194fa466e2edb65d9c1c5f6"
   license "PostgreSQL"
+  revision 1
 
   livecheck do
     url "https://ftp.postgresql.org/pub/source/"
@@ -44,6 +45,11 @@ class PostgresqlAT12 < Formula
     depends_on "linux-pam"
     depends_on "util-linux"
   end
+
+  # Fix compatibility with OpenSSL 3.2
+  # Remove once merged
+  # Ref https://www.postgresql.org/message-id/CX9SU44GH3P4.17X6ZZUJ5D40N%40neon.tech
+  patch :DATA
 
   def install
     ENV.delete "PKG_CONFIG_LIBDIR" if MacOS.version == :catalina
@@ -183,3 +189,156 @@ class PostgresqlAT12 < Formula
     assert_equal (opt_include/"postgresql/server").to_s, shell_output("#{bin}/pg_config --includedir-server").chomp
   end
 end
+
+__END__
+diff --git a/configure b/configure
+index cce104aebb..e65ef98a81 100755
+--- a/configure
++++ b/configure
+@@ -12641,7 +12641,7 @@ done
+   # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
+   # doesn't have these OpenSSL 1.1.0 functions. So check for individual
+   # functions.
+-  for ac_func in OPENSSL_init_ssl BIO_get_data BIO_meth_new ASN1_STRING_get0_data
++  for ac_func in OPENSSL_init_ssl BIO_meth_new ASN1_STRING_get0_data
+ do :
+   as_ac_var=`$as_echo "ac_cv_func_$ac_func" | $as_tr_sh`
+ ac_fn_c_check_func "$LINENO" "$ac_func" "$as_ac_var"
+diff --git a/configure.in b/configure.in
+index 3c93e7a944..b930aa74b4 100644
+--- a/configure.in
++++ b/configure.in
+@@ -1290,7 +1290,7 @@ if test "$with_openssl" = yes ; then
+   # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
+   # doesn't have these OpenSSL 1.1.0 functions. So check for individual
+   # functions.
+-  AC_CHECK_FUNCS([OPENSSL_init_ssl BIO_get_data BIO_meth_new ASN1_STRING_get0_data])
++  AC_CHECK_FUNCS([OPENSSL_init_ssl BIO_meth_new ASN1_STRING_get0_data])
+   # OpenSSL versions before 1.1.0 required setting callback functions, for
+   # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
+   # function was removed.
+diff --git a/src/backend/libpq/be-secure-openssl.c b/src/backend/libpq/be-secure-openssl.c
+index b0a1f7258a..43c0d100d8 100644
+--- a/src/backend/libpq/be-secure-openssl.c
++++ b/src/backend/libpq/be-secure-openssl.c
+@@ -699,10 +699,6 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
+  * to retry; do we need to adopt their logic for that?
+  */
+
+-#ifndef HAVE_BIO_GET_DATA
+-#define BIO_get_data(bio) (bio->ptr)
+-#define BIO_set_data(bio, data) (bio->ptr = data)
+-#endif
+
+ static BIO_METHOD *my_bio_methods = NULL;
+
+@@ -713,7 +709,7 @@ my_sock_read(BIO *h, char *buf, int size)
+
+ 	if (buf != NULL)
+ 	{
+-		res = secure_raw_read(((Port *) BIO_get_data(h)), buf, size);
++		res = secure_raw_read(((Port *) BIO_get_app_data(h)), buf, size);
+ 		BIO_clear_retry_flags(h);
+ 		if (res <= 0)
+ 		{
+@@ -733,7 +729,7 @@ my_sock_write(BIO *h, const char *buf, int size)
+ {
+ 	int			res = 0;
+
+-	res = secure_raw_write(((Port *) BIO_get_data(h)), buf, size);
++	res = secure_raw_write(((Port *) BIO_get_app_data(h)), buf, size);
+ 	BIO_clear_retry_flags(h);
+ 	if (res <= 0)
+ 	{
+@@ -809,7 +805,7 @@ my_SSL_set_fd(Port *port, int fd)
+ 		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
+ 		goto err;
+ 	}
+-	BIO_set_data(bio, port);
++	BIO_set_app_data(bio, port);
+
+ 	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+ 	SSL_set_bio(port->ssl, bio, bio);
+diff --git a/src/include/pg_config.h.in b/src/include/pg_config.h.in
+index 457a8713cc..1e9d21c3e4 100644
+--- a/src/include/pg_config.h.in
++++ b/src/include/pg_config.h.in
+@@ -96,9 +96,6 @@
+ /* Define to 1 if you have the <atomic.h> header file. */
+ #undef HAVE_ATOMIC_H
+
+-/* Define to 1 if you have the `BIO_get_data' function. */
+-#undef HAVE_BIO_GET_DATA
+-
+ /* Define to 1 if you have the `BIO_meth_new' function. */
+ #undef HAVE_BIO_METH_NEW
+
+diff --git a/src/include/pg_config.h.win32 b/src/include/pg_config.h.win32
+index 42fd7067f1..37accc560b 100644
+--- a/src/include/pg_config.h.win32
++++ b/src/include/pg_config.h.win32
+@@ -75,9 +75,6 @@
+ /* Define to 1 if you have the `ASN1_STRING_get0_data' function. */
+ /* #undef HAVE_ASN1_STRING_GET0_DATA */
+
+-/* Define to 1 if you have the `BIO_get_data' function. */
+-/* #undef HAVE_BIO_GET_DATA */
+-
+ /* Define to 1 if you have the `BIO_meth_new' function. */
+ /* #undef HAVE_BIO_METH_NEW */
+
+diff --git a/src/interfaces/libpq/fe-secure-openssl.c b/src/interfaces/libpq/fe-secure-openssl.c
+index 5948a37983..3e085f8e88 100644
+--- a/src/interfaces/libpq/fe-secure-openssl.c
++++ b/src/interfaces/libpq/fe-secure-openssl.c
+@@ -1491,11 +1491,6 @@ PQsslAttribute(PGconn *conn, const char *attribute_name)
+  * to retry; do we need to adopt their logic for that?
+  */
+
+-#ifndef HAVE_BIO_GET_DATA
+-#define BIO_get_data(bio) (bio->ptr)
+-#define BIO_set_data(bio, data) (bio->ptr = data)
+-#endif
+-
+ static BIO_METHOD *my_bio_methods;
+
+ static int
+@@ -1503,7 +1498,7 @@ my_sock_read(BIO *h, char *buf, int size)
+ {
+ 	int			res;
+
+-	res = pqsecure_raw_read((PGconn *) BIO_get_data(h), buf, size);
++	res = pqsecure_raw_read((PGconn *) BIO_get_app_data(h), buf, size);
+ 	BIO_clear_retry_flags(h);
+ 	if (res < 0)
+ 	{
+@@ -1533,7 +1528,7 @@ my_sock_write(BIO *h, const char *buf, int size)
+ {
+ 	int			res;
+
+-	res = pqsecure_raw_write((PGconn *) BIO_get_data(h), buf, size);
++	res = pqsecure_raw_write((PGconn *) BIO_get_app_data(h), buf, size);
+ 	BIO_clear_retry_flags(h);
+ 	if (res < 0)
+ 	{
+@@ -1624,7 +1619,7 @@ my_SSL_set_fd(PGconn *conn, int fd)
+ 		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
+ 		goto err;
+ 	}
+-	BIO_set_data(bio, conn);
++	BIO_set_app_data(bio, conn);
+
+ 	SSL_set_bio(conn->ssl, bio, bio);
+ 	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+diff --git a/src/tools/msvc/Solution.pm b/src/tools/msvc/Solution.pm
+index 20ce233af4..a7e5fdbda9 100644
+--- a/src/tools/msvc/Solution.pm
++++ b/src/tools/msvc/Solution.pm
+@@ -273,7 +273,6 @@ sub GenerateFiles
+ 				|| ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0'))
+ 			{
+ 				print $o "#define HAVE_ASN1_STRING_GET0_DATA 1\n";
+-				print $o "#define HAVE_BIO_GET_DATA 1\n";
+ 				print $o "#define HAVE_BIO_METH_NEW 1\n";
+ 				print $o "#define HAVE_OPENSSL_INIT_SSL 1\n";
+ 			}
